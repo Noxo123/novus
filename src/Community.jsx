@@ -1,11 +1,10 @@
 import React,{useEffect,useState} from 'react';
 import './community.css';
-
 const api=async(path,opts={})=>{const r=await fetch(path,{credentials:'same-origin',...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});const text=await r.text();let d={};try{d=text?JSON.parse(text):{}}catch{d={error:text||'Erreur serveur'}}if(!r.ok)throw Error(d.error||`Erreur HTTP ${r.status}`);return d};
-
 export default function Community(){
- const[user,setUser]=useState(null),[plugins,setPlugins]=useState([]),[q,setQ]=useState(''),[mode,setMode]=useState('plugins'),[busy,setBusy]=useState(true),[error,setError]=useState(''),[auth,setAuth]=useState({email:'',password:'',displayName:''}),[form,setForm]=useState({name:'',version:'',description:''}),[selected,setSelected]=useState(null),[contrib,setContrib]=useState([]),[profile,setProfile]=useState({displayName:'',password:''}),[authMode,setAuthMode]=useState('login');
- const load=async()=>{try{const m=await api('/api/me');setUser(m.user||null);const p=await api('/api/plugins');setPlugins(p.plugins||[]);if(m.user){const c=await api('/api/my/contributions');setContrib(c.contributions||[]);setProfile({displayName:m.user.displayName,password:''})}}catch(e){setError(e.message)}finally{setBusy(false)}};
+ const initialMode=location.pathname.startsWith('/account')?'account':'plugins';
+ const[user,setUser]=useState(null),[plugins,setPlugins]=useState([]),[q,setQ]=useState(''),[mode,setMode]=useState(initialMode),[busy,setBusy]=useState(true),[error,setError]=useState(''),[auth,setAuth]=useState({email:'',password:'',displayName:''}),[form,setForm]=useState({name:'',version:'',description:''}),[selected,setSelected]=useState(null),[contrib,setContrib]=useState([]),[profile,setProfile]=useState({displayName:'',password:''}),[authMode,setAuthMode]=useState('login');
+ const load=async()=>{try{const m=await api('/api/me');setUser(m.user||null);const p=await api('/api/plugins');setPlugins(p.plugins||[]);if(m.user){const c=await api('/api/my/contributions');setContrib(c.contributions||[]);setProfile({displayName:m.user.displayName,password:''})}else if(initialMode==='account')setMode('login')}catch(e){setError(e.message)}finally{setBusy(false)}};
  useEffect(()=>{load()},[]);
  const search=async value=>{setQ(value);try{const d=await api('/api/plugins?q='+encodeURIComponent(value));setPlugins(d.plugins||[])}catch(e){setError(e.message)}};
  const authenticate=async()=>{setError('');try{const d=await api(authMode==='register'?'/api/auth/register':'/api/auth/login',{method:'POST',body:JSON.stringify(auth)});setUser(d.user);setMode('account');await load()}catch(e){setError(e.message)}};
