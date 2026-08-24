@@ -13,7 +13,20 @@ const sessions=new Map(),rate=new Map();
 for(const d of [quarantineDir,dataDir])mkdirSync(d,{recursive:true});
 for(const [f,v] of [[pluginsFile,'[]'],[auditFile,''],[usersFile,'[]'],[settingsFile,JSON.stringify({quickCreateEnabled:true},null,2)]])if(!existsSync(f))writeFileSync(f,v,{mode:0o600});
 const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2'};
-const securityHeaders={'X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'strict-origin-when-cross-origin','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':"default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"};
+const securityHeaders = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'Content-Security-Policy':
+    "default-src 'self'; " +
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+    "font-src 'self' https://fonts.gstatic.com; " +
+    "script-src 'self'; " +
+    "img-src 'self' data:; " +
+    "connect-src 'self'; " +
+    "frame-ancestors 'none'"
+};
 const send=(res,status,body,type='application/json; charset=utf-8',extra={})=>{res.writeHead(status,{...securityHeaders,'Content-Type':type,...extra});res.end(typeof body==='string'?body:JSON.stringify(body))};
 const safePath=p=>{const d=decodeURIComponent(p),c=normalize(join(publicDir,d==='/'?'index.html':d)),r=relative(publicDir,c);return r===''||(!r.startsWith('..'+sep)&&r!=='..')?c:null};
 async function readJson(req,limit=maxUploadBytes*1.4){let total=0;const chunks=[];for await(const c of req){total+=c.length;if(total>limit)throw Error('PAYLOAD_TOO_LARGE');chunks.push(c)}return JSON.parse(Buffer.concat(chunks).toString('utf8'))}
