@@ -1,11 +1,12 @@
 import http from 'node:http';
-import { existsSync, readFileSync } from 'node:fs';
-import { extname, join, normalize } from 'node:path';
+import { existsSync, statSync, createReadStream } from 'node:fs';
+import { extname, join, normalize, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const publicDir = join(__dirname, 'dist');
-const port = Number(process.env.PORT || 3000);
+const port = Number(process.env.SERVER_PORT || process.env.PORT || 3000);
+const host = process.env.SERVER_IP || process.env.HOST || '0.0.0.0';
 
 const mime = {
   '.html': 'text/html; charset=utf-8',
@@ -18,6 +19,8 @@ const mime = {
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
   '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
 };
 
 const securityHeaders = {
@@ -27,47 +30,61 @@ const securityHeaders = {
   'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
 };
 
-function serve(res, file) {
-  const type = mime[extname(file)] || 'application/octet-stream';
-  res.writeHead(200, { ...securityHeaders, 'Content-Type': type });
-  res.end(readFileSync(file));
+function send(res, status, body, type = 'text/plain; charset=utf-8') {
+  res.writeHead(status, { ...securityHeaders, 'Content-Type': type });
+  res.end(body);
+}
+
+function safePath(urlPath) {
+  const decoded = decodeURIComponent(urlPath);
+  const candidate = normalize(join(publicDir, decoded === '/' ? 'index.html' : decoded));
+  const rel = relative(publicDir, candidate);
+  return rel === '' || (!rel.startsWith('..' + sep) && rel !== '..') ? candidate : null;
 }
 
 const server = http.createServer((req, res) => {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    res.writeHead(405, securityHeaders);
-    return res.end('Method Not Allowed');
+    return send(res, 405, 'Method Not Allowed');
   }
 
-  const urlPath = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;
-  const requested = normalize(join(publicDir, urlPath === '/' ? 'index.html' : urlPath));
-
-  // Never serve files outside dist/.
-  if (!requested.startsWith(publicDir)) {
-    res.writeHead(403, securityHeaders);
-    return res.end('Forbidden');
-  }
-
-  // SPA fallback: unknown routes return index.html.
-  const file = existsSync(requested) ? requested : join(publicDir, 'index.html');
-  if (!existsSync(file)) {
-    res.writeHead(503, securityHeaders);
-    return res.end('Build not found. Run npm run build first.');
-  }
-
-  if (req.method === 'HEAD') {
-    res.writeHead(200, { ...securityHeaders, 'Content-Type': mime[extname(file)] || 'application/octet-stream' });
-    return res.end();
-  }
-
+  let urlPath;
   try {
-    serve(res, file);
+    urlPath = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;
   } catch {
-    res.writeHead(500, securityHeaders);
-    res.end('Internal Server Error');
+    return send(res, 400, 'Bad Request');
   }
+
+  let requested;
+  try {
+    requested = safePath(urlPath);
+  } catch {
+    return send(res, 400, 'Bad Request');
+  }
+
+  if (!requested) return send(res, 403, 'Forbidden');
+
+  // SPA fallback for client-side routes.
+  const file = existsSync(requested) && statSync(requested).isFile()
+    ? requested
+    : join(publicDir, 'index.html');
+
+  if (!existsSync(file)) {
+    return send(res, 503, 'Build not found. Run npm run build first.');
+  }
+
+  const type = mime[extname(file)] || 'application/octet-stream';
+  const size = statSync(file).size;
+  res.writeHead(200, { ...securityHeaders, 'Content-Type': type, 'Content-Length': size, 'Cache-Control': extname(file) === '.html' ? 'no-cache' : 'public, max-age=3600' });
+
+  if (req.method === 'HEAD') return res.end();
+  createReadStream(file).pipe(res);
 });
 
-server.listen(port, () => {
-  console.log(`NOVUS running on http://localhost:${port}`);
+server.on('error', (error) => {
+  console.error('NOVUS server error:', error);
+  process.exitCode = 1;
+});
+
+server.listen(port, host, () => {
+  console.log(`NOVUS listening on ${host}:${port}`);
 });
