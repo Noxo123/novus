@@ -1,0 +1,68 @@
+name: Persist user sessions
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch persistent sessions
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('server.js')
+          s = p.read_text()
+
+          s = s.replace(
+              "const sessions=new Map(),userSessions=new Map(),rate=new Map();let updateRunning=false;",
+              "const sessions=new Map(),userSessions=new Map(),rate=new Map();let updateRunning=false;\nconst userSessionsFile=join(dataDir,'user-sessions.json');\nif(!existsSync(userSessionsFile))writeFileSync(userSessionsFile,'[]',{mode:0o600});\nconst sessionHash=t=>createHash('sha256').update(String(t)).digest('hex');\nfunction loadPersistentUserSessions(){const now=Date.now(),items=loadJson(userSessionsFile,[]).filter(x=>x&&x.expires>now&&x.tokenHash&&x.userId);userSessions.clear();for(const x of items)userSessions.set(x.tokenHash,{userId:x.userId,expires:x.expires});saveJson(userSessionsFile,items)}\nfunction persistUserSession(token,userId,expires){const items=loadJson(userSessionsFile,[]).filter(x=>x.expires>Date.now()&&x.tokenHash!==sessionHash(token));items.push({tokenHash:sessionHash(token),userId,expires});saveJson(userSessionsFile,items)}\nfunction removePersistentUserSession(token){const h=sessionHash(token),items=loadJson(userSessionsFile,[]).filter(x=>x.tokenHash!==h&&x.expires>Date.now());saveJson(userSessionsFile,items)}\nfunction cleanupPersistentUserSessions(){const items=loadJson(userSessionsFile,[]).filter(x=>x&&x.expires>Date.now());saveJson(userSessionsFile,items)}\n",
+          )
+
+          s = s.replace(
+              "function userSession(req){const t=getCookie(req,'novus_user'),s=t?userSessions.get(t):null;if(!s||s.expires<Date.now()){if(t)userSessions.delete(t);return null}return s}",
+              "function userSession(req){const t=getCookie(req,'novus_user');if(!t)return null;let s=userSessions.get(t)||userSessions.get(sessionHash(t));if(!s){const h=sessionHash(t),item=loadJson(userSessionsFile,[]).find(x=>x.tokenHash===h&&x.expires>Date.now());if(item){s={userId:item.userId,expires:item.expires};userSessions.set(t,s)}}if(!s||s.expires<Date.now()){userSessions.delete(t);removePersistentUserSession(t);return null}return s}"
+          )
+
+          s = s.replace(
+              "const t=randomBytes(32).toString('hex');userSessions.set(t,{userId:u.id,expires:Date.now()+30*24*3600000});audit('user_registered',{id:u.id,email});",
+              "const t=randomBytes(32).toString('hex'),expires=Date.now()+30*24*3600000;userSessions.set(t,{userId:u.id,expires});persistUserSession(t,u.id,expires);audit('user_registered',{id:u.id,email});"
+          )
+
+          s = s.replace(
+              "const t=randomBytes(32).toString('hex');userSessions.set(t,{userId:u.id,expires:Date.now()+30*24*3600000});audit('user_login',{id:u.id,email:u.email});",
+              "const t=randomBytes(32).toString('hex'),expires=Date.now()+30*24*3600000;userSessions.set(t,{userId:u.id,expires});persistUserSession(t,u.id,expires);audit('user_login',{id:u.id,email:u.email});"
+          )
+
+          s = s.replace(
+              "if(t)userSessions.delete(t);return send(res,200,{ok:true},'application/json; charset=utf-8',{'Set-Cookie':setCookie('novus_user','',0)})",
+              "if(t){userSessions.delete(t);removePersistentUserSession(t)}return send(res,200,{ok:true},'application/json; charset=utf-8',{'Set-Cookie':setCookie('novus_user','',0)})"
+          )
+
+          marker = "function accountPublic(u){"
+          if "loadPersistentUserSessions();" not in s:
+              s = s.replace(marker, "loadPersistentUserSessions();\nsetInterval(cleanupPersistentUserSessions,60*60*1000);\n" + marker, 1)
+
+          p.write_text(s)
+          PY
+
+      - name: Validate server.js
+        run: node --check server.js
+
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server.js
+          if git diff --cached --quiet; then
+            echo 'No changes needed'
+          else
+            git commit -m 'fix: persist user sessions across restarts'
+            git push
+          fi
