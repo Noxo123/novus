@@ -1,57 +1,60 @@
 import http from 'node:http';
-import { existsSync, statSync, createReadStream, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, statSync, createReadStream, mkdirSync, writeFileSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { extname, join, normalize, relative, sep, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, randomBytes, createHash, scryptSync, timingSafeEqual } from 'node:crypto';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const publicDir = join(__dirname, 'dist');
 const quarantineDir = join(__dirname, 'quarantine');
+const dataDir = join(__dirname, 'data');
+const pluginsFile = join(dataDir, 'plugins.json');
+const auditFile = join(dataDir, 'audit.log');
 const port = Number(process.env.SERVER_PORT || process.env.PORT || 3000);
 const host = process.env.SERVER_IP || process.env.HOST || '0.0.0.0';
 const githubRepo = process.env.GITHUB_REPO || 'Noxo123/novus-communauter';
 const githubToken = process.env.GITHUB_TOKEN;
 const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const maxUploadBytes = Number(process.env.MAX_UPLOAD_BYTES || 10 * 1024 * 1024);
+const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH || '';
+const sessions = new Map();
+const loginAttempts = new Map();
+const rate = new Map();
 
 mkdirSync(quarantineDir, { recursive: true });
+mkdirSync(dataDir, { recursive: true });
+if (!existsSync(pluginsFile)) writeFileSync(pluginsFile, '[]', { mode: 0o600 });
+if (!existsSync(auditFile)) writeFileSync(auditFile, '', { mode: 0o600 });
 
 const mime = { '.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2' };
-const securityHeaders = { 'X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'strict-origin-when-cross-origin','Content-Security-Policy':"default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'" };
-
-function send(res,status,body,type='application/json; charset=utf-8'){res.writeHead(status,{...securityHeaders,'Content-Type':type});res.end(typeof body==='string'?body:JSON.stringify(body));}
+const securityHeaders = { 'X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'strict-origin-when-cross-origin','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':"default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'" };
+function send(res,status,body,type='application/json; charset=utf-8',extra={}){res.writeHead(status,{...securityHeaders,'Content-Type':type,...extra});res.end(typeof body==='string'?body:JSON.stringify(body));}
 function safePath(urlPath){const decoded=decodeURIComponent(urlPath);const candidate=normalize(join(publicDir,decoded==='/'?'index.html':decoded));const rel=relative(publicDir,candidate);return rel===''||(!rel.startsWith('..'+sep)&&rel!=='..')?candidate:null;}
-async function readJson(req){let total=0;const chunks=[];for await(const chunk of req){total+=chunk.length;if(total>maxUploadBytes*1.4)throw new Error('PAYLOAD_TOO_LARGE');chunks.push(chunk);}return JSON.parse(Buffer.concat(chunks).toString('utf8'));}
+async function readJson(req,limit=maxUploadBytes*1.4){let total=0;const chunks=[];for await(const chunk of req){total+=chunk.length;if(total>limit)throw new Error('PAYLOAD_TOO_LARGE');chunks.push(chunk);}return JSON.parse(Buffer.concat(chunks).toString('utf8'));}
 function cleanName(name){return basename(String(name||'contribution.bin')).replace(/[^a-zA-Z0-9._-]/g,'_').slice(0,120)||'contribution.bin';}
-
-async function githubIssue({id,filename,size,sha256,author}){
-  if(!githubToken)return null;
-  const response=await fetch(`https://api.github.com/repos/${githubRepo}/issues`,{method:'POST',headers:{Authorization:`Bearer ${githubToken}`,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','Content-Type':'application/json'},body:JSON.stringify({title:`[COMMUNITY] Contribution ${filename}`,labels:['community','needs-analysis'],body:`## Nouvelle contribution\n\n- **ID:** \`${id}\`\n- **Fichier:** \`${filename}\`\n- **Taille:** ${size} octets\n- **SHA-256:** \`${sha256}\`\n- **Auteur:** ${author||'anonyme'}\n\nLe fichier est placé en quarantaine sur NOVUS et doit être analysé avant toute intégration.\n\n> Cette issue est une demande de traitement. Elle ne déclenche aucun déploiement automatique.`})});
-  if(!response.ok)throw new Error(`GitHub API ${response.status}`);return response.json();
+function loadPlugins(){try{return JSON.parse(readFileSync(pluginsFile,'utf8'));}catch{return [];}}
+function savePlugins(items){writeFileSync(pluginsFile,JSON.stringify(items,null,2),{mode:0o600});}
+function audit(action,meta={}){const line=JSON.stringify({at:new Date().toISOString(),action,...meta})+'\n';writeFileSync(auditFile,line,{flag:'a',mode:0o600});}
+function getCookie(req,name){const value=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith(`${name}=`));return value?decodeURIComponent(value.slice(name.length+1)):null;}
+function session(req){const token=getCookie(req,'novus_admin');const item=token?sessions.get(token):null;if(!item||item.expires<Date.now()){if(token)sessions.delete(token);return null;}return item;}
+function requireAdmin(req,res){const s=session(req);if(!s){send(res,401,{error:'ADMIN_AUTH_REQUIRED'});return null;}return s;}
+function checkRate(ip,key,limit,windowMs){const now=Date.now();const k=`${key}:${ip}`;const arr=(rate.get(k)||[]).filter(t=>now-t<windowMs);arr.push(now);rate.set(k,arr);return arr.length<=limit;}
+function verifyPassword(password){if(!adminPasswordHash)return false;const [saltHex,hashHex]=adminPasswordHash.split('$');if(!saltHex||!hashHex)return false;try{const derived=scryptSync(String(password),Buffer.from(saltHex,'hex'),32);const expected=Buffer.from(hashHex,'hex');return expected.length===derived.length&&timingSafeEqual(expected,derived);}catch{return false;}}
+async function githubIssue({id,filename,size,sha256,author}){if(!githubToken)return null;const response=await fetch(`https://api.github.com/repos/${githubRepo}/issues`,{method:'POST',headers:{Authorization:`Bearer ${githubToken}`,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','Content-Type':'application/json'},body:JSON.stringify({title:`[COMMUNITY] Contribution ${filename}`,labels:['community','needs-analysis'],body:`## Nouvelle contribution\n\n- **ID:** \`${id}\`\n- **Fichier:** \`${filename}\`\n- **Taille:** ${size} octets\n- **SHA-256:** \`${sha256}\`\n- **Auteur:** ${author||'anonyme'}\n\nFichier placé en quarantaine NOVUS. Analyse obligatoire avant intégration.`})});if(!response.ok)throw new Error(`GitHub API ${response.status}`);return response.json();}
+async function discordNotify({id,filename,size,sha256,issueUrl}){if(!discordWebhookUrl)return;const content=['📦 **NOVUS — Nouvelle contribution**',`> Fichier : **${filename}**`,`> Taille : **${size} octets**`,`> ID : \`${id}\``,`> SHA-256 : \`${sha256.slice(0,16)}…\``,issueUrl?`🔎 [Voir la proposition GitHub](${issueUrl})`:'🔎 Proposition GitHub non configurée'].join('\n');const response=await fetch(discordWebhookUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,allowed_mentions:{parse:[]}})});if(!response.ok)throw new Error(`Discord webhook ${response.status}`);}
+async function submitContribution(req,res){const payload=await readJson(req);const filename=cleanName(payload.filename);const data=String(payload.data||'');const author=String(payload.author||'').slice(0,80);if(!['.jar','.zip'].includes(extname(filename).toLowerCase()))return send(res,400,{error:'Only .jar and .zip files are accepted.'});if(!data||data.length>Math.ceil(maxUploadBytes*1.4))return send(res,413,{error:'File is too large.'});let buffer;try{buffer=Buffer.from(data,'base64');}catch{return send(res,400,{error:'Invalid file encoding.'});}if(buffer.length>maxUploadBytes)return send(res,413,{error:`Maximum upload size is ${maxUploadBytes} bytes.`});const id=randomUUID();const sha256=createHash('sha256').update(buffer).digest('hex');const storedName=`${id}__${filename}`;writeFileSync(join(quarantineDir,storedName),buffer,{flag:'wx',mode:0o600});let issue=null;try{issue=await githubIssue({id,filename,size:buffer.length,sha256,author});}catch(error){console.error('GitHub contribution error:',error.message);}try{await discordNotify({id,filename,size:buffer.length,sha256,issueUrl:issue?.html_url});}catch(error){console.error('Discord notification error:',error.message);}audit('contribution_received',{id,filename,size:buffer.length,sha256,author});return send(res,201,{ok:true,id,filename,size:buffer.length,sha256,issueUrl:issue?.html_url||null,status:'QUARANTINED'});}
+async function adminApi(req,res,url){const admin=requireAdmin(req,res);if(!admin)return;
+  if(req.method==='GET'&&url==='/api/admin/overview'){const files=readdirSync(quarantineDir);return send(res,200,{ok:true,plugins:loadPlugins(),quarantineCount:files.length,quarantine:files.map(name=>({name,size:statSync(join(quarantineDir,name)).size})),githubRepo,githubConfigured:Boolean(githubToken),discordConfigured:Boolean(discordWebhookUrl)});}
+  if(req.method==='POST'&&url==='/api/admin/plugins'){const p=await readJson(req,100000);const name=String(p.name||'').trim().slice(0,80);if(!name)return send(res,400,{error:'Plugin name required'});const item={id:randomUUID(),name,version:String(p.version||'').slice(0,40),status:['pending','approved','rejected','maintenance'].includes(p.status)?p.status:'pending',notes:String(p.notes||'').slice(0,500),createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};const items=loadPlugins();items.push(item);savePlugins(items);audit('plugin_created',{id:item.id,name:item.name});return send(res,201,item);}
+  const match=url.match(/^\/api\/admin\/plugins\/([^/]+)$/);if(match&&req.method==='PATCH'){const id=decodeURIComponent(match[1]);const p=await readJson(req,100000);const items=loadPlugins();const item=items.find(x=>x.id===id);if(!item)return send(res,404,{error:'Plugin not found'});if(p.name!==undefined)item.name=String(p.name).trim().slice(0,80);if(p.version!==undefined)item.version=String(p.version).slice(0,40);if(p.notes!==undefined)item.notes=String(p.notes).slice(0,500);if(p.status!==undefined&&['pending','approved','rejected','maintenance'].includes(p.status))item.status=p.status;item.updatedAt=new Date().toISOString();savePlugins(items);audit('plugin_updated',{id,changes:p});return send(res,200,item);}
+  if(match&&req.method==='DELETE'){const id=decodeURIComponent(match[1]);const items=loadPlugins();if(!items.some(x=>x.id===id))return send(res,404,{error:'Plugin not found'});savePlugins(items.filter(x=>x.id!==id));audit('plugin_deleted',{id});return send(res,204,'');}
+  if(req.method==='GET'&&url==='/api/admin/audit'){const lines=readFileSync(auditFile,'utf8').trim().split('\n').filter(Boolean).slice(-200).reverse().map(x=>{try{return JSON.parse(x)}catch{return {raw:x}}});return send(res,200,{events:lines});}
+  if(req.method==='POST'&&url==='/api/admin/quarantine/purge'){const files=readdirSync(quarantineDir);for(const name of files){try{unlinkSync(join(quarantineDir,name));}catch{}}audit('quarantine_purged',{count:files.length});return send(res,200,{ok:true,deleted:files.length});}
+  return send(res,404,{error:'Admin route not found'});
 }
-async function discordNotify({id,filename,size,sha256,issueUrl}){
-  if(!discordWebhookUrl)return;
-  const content=['📦 **NOVUS — Nouvelle contribution**',`> Fichier : **${filename}**`,`> Taille : **${size} octets**`,`> ID : \`${id}\``,`> SHA-256 : \`${sha256.slice(0,16)}…\``,issueUrl?`🔎 [Voir la proposition GitHub](${issueUrl})`:'🔎 Proposition GitHub en attente de configuration'].join('\n');
-  const response=await fetch(discordWebhookUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,allowed_mentions:{parse:[]}})});if(!response.ok)throw new Error(`Discord webhook ${response.status}`);
-}
-async function submitContribution(req,res){
-  const payload=await readJson(req);const filename=cleanName(payload.filename);const data=String(payload.data||'');const author=String(payload.author||'').slice(0,80);
-  if(!['.jar','.zip'].includes(extname(filename).toLowerCase()))return send(res,400,{error:'Only .jar and .zip files are accepted.'});
-  if(!data||data.length>Math.ceil(maxUploadBytes*1.4))return send(res,413,{error:'File is too large.'});
-  let buffer;try{buffer=Buffer.from(data,'base64');}catch{return send(res,400,{error:'Invalid file encoding.'});}
-  if(buffer.length>maxUploadBytes)return send(res,413,{error:`Maximum upload size is ${maxUploadBytes} bytes.`});
-  const id=randomUUID();const sha256=createHash('sha256').update(buffer).digest('hex');const storedName=`${id}__${filename}`;writeFileSync(join(quarantineDir,storedName),buffer,{flag:'wx',mode:0o600});
-  let issue=null;try{issue=await githubIssue({id,filename,size:buffer.length,sha256,author});}catch(error){console.error('GitHub contribution error:',error.message);}
-  try{await discordNotify({id,filename,size:buffer.length,sha256,issueUrl:issue?.html_url});}catch(error){console.error('Discord notification error:',error.message);}
-  return send(res,201,{ok:true,id,filename,size:buffer.length,sha256,issueUrl:issue?.html_url||null,status:'QUARANTINED'});
-}
-
-const server=http.createServer(async(req,res)=>{
-  if(req.method==='POST'&&req.url==='/api/contributions'){try{return await submitContribution(req,res);}catch(error){if(error.message==='PAYLOAD_TOO_LARGE')return send(res,413,{error:'Payload too large.'});console.error('Contribution error:',error);return send(res,400,{error:'Invalid contribution request.'});}}
-  if(req.method!=='GET'&&req.method!=='HEAD')return send(res,405,'Method Not Allowed','text/plain; charset=utf-8');
-  let urlPath;try{urlPath=new URL(req.url||'/',`http://${req.headers.host||'localhost'}`).pathname;}catch{return send(res,400,'Bad Request','text/plain; charset=utf-8');}
-  let requested;try{requested=safePath(urlPath);}catch{return send(res,400,'Bad Request','text/plain; charset=utf-8');}if(!requested)return send(res,403,'Forbidden','text/plain; charset=utf-8');
-  const file=existsSync(requested)&&statSync(requested).isFile()?requested:join(publicDir,'index.html');if(!existsSync(file))return send(res,503,'Build not found. Run npm run build first.','text/plain; charset=utf-8');
-  const type=mime[extname(file)]||'application/octet-stream';const size=statSync(file).size;res.writeHead(200,{...securityHeaders,'Content-Type':type,'Content-Length':size,'Cache-Control':extname(file)==='.html'?'no-cache':'public, max-age=3600'});if(req.method==='HEAD')return res.end();createReadStream(file).pipe(res);
-});
+const server=http.createServer(async(req,res)=>{let url;try{url=new URL(req.url||'/',`http://${req.headers.host||'localhost'}`);}catch{return send(res,400,{error:'Bad Request'});}if(req.method==='POST'&&url.pathname==='/api/admin/login'){const ip=req.socket.remoteAddress||'unknown';if(!checkRate(ip,'login',8,10*60*1000))return send(res,429,{error:'Too many attempts. Try again later.'});try{const p=await readJson(req,10000);if(!verifyPassword(p.password))return send(res,401,{error:'Invalid credentials'});const token=randomBytes(32).toString('hex');sessions.set(token,{expires:Date.now()+8*60*60*1000,csrf:randomBytes(24).toString('hex')});audit('admin_login');return send(res,200,{ok:true,csrf:sessions.get(token).csrf},{'Content-Type':'application/json; charset=utf-8','Set-Cookie':`novus_admin=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=28800`});}catch{return send(res,400,{error:'Invalid request'});}}
+if(req.method==='POST'&&url.pathname==='/api/admin/logout'){const token=getCookie(req,'novus_admin');if(token)sessions.delete(token);return send(res,200,{ok:true},{'Set-Cookie':'novus_admin=; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=0'});}
+if(url.pathname.startsWith('/api/admin/')){const s=session(req);if(s&&req.method!=='GET'&&url.pathname!=='/api/admin/login'){const csrf=req.headers['x-csrf-token'];if(csrf!==s.csrf)return send(res,403,{error:'CSRF validation failed'});}try{return await adminApi(req,res,url.pathname);}catch(error){console.error('Admin API error:',error);return send(res,400,{error:'Invalid admin request'});}}
+if(req.method==='POST'&&url.pathname==='/api/contributions'){if(!checkRate(req.socket.remoteAddress||'unknown','upload',12,60*60*1000))return send(res,429,{error:'Upload rate limit exceeded.'});try{return await submitContribution(req,res);}catch(error){if(error.message==='PAYLOAD_TOO_LARGE')return send(res,413,{error:'Payload too large.'});console.error('Contribution error:',error);return send(res,400,{error:'Invalid contribution request.'});}}
+if(req.method!=='GET'&&req.method!=='HEAD')return send(res,405,'Method Not Allowed','text/plain; charset=utf-8');let requested;try{requested=safePath(url.pathname);}catch{return send(res,400,'Bad Request','text/plain; charset=utf-8');}if(!requested)return send(res,403,'Forbidden','text/plain; charset=utf-8');const file=existsSync(requested)&&statSync(requested).isFile()?requested:join(publicDir,'index.html');if(!existsSync(file))return send(res,503,'Build not found. Run npm run build first.','text/plain; charset=utf-8');const type=mime[extname(file)]||'application/octet-stream';const size=statSync(file).size;res.writeHead(200,{...securityHeaders,'Content-Type':type,'Content-Length':size,'Cache-Control':extname(file)==='.html'?'no-cache':'public, max-age=3600'});if(req.method==='HEAD')return res.end();createReadStream(file).pipe(res);});
 server.on('error',error=>{console.error('NOVUS server error:',error);process.exitCode=1;});server.listen(port,host,()=>console.log(`NOVUS listening on ${host}:${port}`));
